@@ -3,6 +3,9 @@
  *
  * Reports agent status to workmux for tmux window status display.
  * See: https://workmux.raine.dev/guide/status-tracking
+ *
+ * Also runs under pi_agent_rust, whose extension host has no `ctx.isIdle()`,
+ * no `agent_settled` event, and a `child_process.spawn` shim without stdin.
  */
 
 import { spawn } from "node:child_process";
@@ -31,8 +34,25 @@ function execWithPrompt(args: string[], prompt: PendingPrompt): Promise<number> 
   });
 }
 
+// pi_agent_rust's `pi.exec` runs commands directly, so a shell pipes the
+// prompt into workmux instead.
+async function execWithPromptViaShell(
+  pi: ExtensionAPI,
+  args: string[],
+  prompt: PendingPrompt,
+): Promise<number> {
+  const script = 'input=$1; shift; printf "%s" "$input" | workmux "$@"';
+  const input = JSON.stringify({ prompt: prompt.text });
+  const { code } = await pi.exec("sh", ["-c", script, "sh", input, ...args], {
+    cwd: prompt.cwd,
+  });
+  return code;
+}
+
 export default function (pi: ExtensionAPI) {
   let sessionActive = false;
+  // Detected per session; pi_agent_rust settles runs with `agent_end`.
+  let isPiRust = false;
   let parentWorking = false;
   let activeCount: number | undefined;
   let unsubscribe: (() => void) | undefined;
@@ -52,7 +72,9 @@ export default function (pi: ExtensionAPI) {
       const args = ["set-window-status", status];
       try {
         const code = prompt
-          ? await execWithPrompt(args, prompt)
+          ? await (isPiRust
+              ? execWithPromptViaShell(pi, args, prompt)
+              : execWithPrompt(args, prompt))
           : (await pi.exec("workmux", args)).code;
         lastStatus = code === 0 ? status : undefined;
       } catch {
@@ -96,7 +118,8 @@ export default function (pi: ExtensionAPI) {
     activeCount = undefined;
     lastStatus = undefined;
     pendingPrompt = undefined;
-    parentWorking = !ctx.isIdle();
+    isPiRust = typeof ctx.isIdle !== "function";
+    parentWorking = !isPiRust && !ctx.isIdle();
     await pi.exec("workmux", ["register-agent"]).catch(() => {});
     sessionActive = true;
     unsubscribe = pi.events.on("suba:activity", (data) => {
@@ -123,6 +146,12 @@ export default function (pi: ExtensionAPI) {
     if (!sessionActive) return;
     parentWorking = true;
     await setStatus("working");
+  });
+
+  pi.on("agent_end", async () => {
+    if (!sessionActive || !isPiRust) return;
+    parentWorking = false;
+    await reportActivity();
   });
 
   pi.on("agent_settled", async (_event, ctx) => {

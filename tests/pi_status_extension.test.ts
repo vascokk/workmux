@@ -51,6 +51,8 @@ async function createHarness(
     snapshot?: number;
     idle?: boolean;
     exec?: (args: string[]) => Promise<number>;
+    // pi_agent_rust: no `ctx.isIdle()`, no `agent_settled`.
+    rust?: boolean;
   } = {},
 ) {
   const handlers = new Map<string, Handler>();
@@ -88,7 +90,13 @@ async function createHarness(
   }
   const pi = {
     events,
-    exec: async (_command: string, args: string[]) => {
+    exec: async (command: string, args: string[], execOptions?: { cwd: string }) => {
+      if (command === 'sh') {
+        // Shell pipe: ['-c', script, '$0', input, ...workmux args].
+        const [, , , input, ...rest] = args;
+        args = rest;
+        spawned.push({ args, cwd: execOptions!.cwd, prompt: JSON.parse(input).prompt });
+      }
       calls.push(args);
       const code = await options.exec?.(args) ?? 0;
       if (args[0] === 'set-window-status' && code === 0) statuses.push(args[1]);
@@ -122,7 +130,7 @@ async function createHarness(
       if (name === 'agent_settled') idle = true;
       if (isIdle !== undefined) idle = isIdle;
       await handlers.get(name)?.({}, {
-        isIdle: () => idle,
+        ...(options.rust ? {} : { isIdle: () => idle }),
         sessionManager: { getBranch: () => branch },
       });
     },
@@ -447,5 +455,58 @@ describe('pi workmux status extension', () => {
     await harness.activity(1);
 
     expect(harness.statuses).toEqual(['done', 'done', 'working']);
+  });
+});
+
+describe('pi workmux status extension on pi_agent_rust', () => {
+  const rust = { rust: true };
+
+  test('registers on session start', async () => {
+    const harness = await createHarness(stoppedMessage(), rust);
+    expect(harness.calls).toEqual([['register-agent']]);
+    expect(harness.statuses).toEqual([]);
+  });
+
+  test('reports done when the agent run ends', async () => {
+    const harness = await createHarness(stoppedMessage(), rust);
+
+    await harness.emit('agent_start');
+    await harness.emit('agent_end');
+
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('reports done after an aborted run', async () => {
+    const harness = await createHarness(abortedMessages[0], rust);
+
+    await harness.emit('agent_start');
+    await harness.emit('agent_end');
+
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('pipes a submitted prompt through a shell', async () => {
+    const harness = await createHarness(stoppedMessage(), rust);
+
+    await harness.input('fix the bug', 'interactive', '/repo/feature');
+    await harness.emit('agent_start');
+    await harness.emit('agent_end');
+
+    expect(spawned).toEqual([
+      { args: ['set-window-status', 'working'], cwd: '/repo/feature', prompt: 'fix the bug' },
+    ]);
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('keeps working while children are active after the run ends', async () => {
+    const harness = await createHarness(stoppedMessage(), { ...rust, snapshot: 0 });
+
+    await harness.emit('agent_start');
+    await harness.activity(1);
+    await harness.emit('agent_end');
+    expect(harness.statuses).toEqual(['done', 'working']);
+
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['done', 'working', 'done']);
   });
 });
